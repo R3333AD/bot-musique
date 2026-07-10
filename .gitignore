@@ -1,0 +1,5 @@
+config.py
+lavalink/*.jar
+__pycache__/
+*.db
+.env
