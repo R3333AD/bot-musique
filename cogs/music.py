@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import math
 import re
 import ssl
@@ -15,8 +16,16 @@ from config import DJ_ROLE_ID
 from utils.db import (
     save_playlist, append_to_playlist, load_playlist, list_playlists,
     delete_playlist, get_music_channel, set_music_channel,
+    save_queue_state, load_queue_state, delete_queue_state,
+    spotify_cache_get, spotify_cache_set, spotify_cache_cleanup,
+    get_guild_theme, set_guild_theme,
 )
-from utils.music_helpers import create_now_playing_embed, create_queue_embed, ACCENT
+from utils.embed_builder import build_embed, COLOR_NOW_PLAYING
+from utils.music_helpers import create_queue_embed
+
+logger = logging.getLogger(__name__)
+
+SEARCH_TIMEOUT = 10.0
 
 SPOTIFY_TRACK_RE = re.compile(
     r"https?://open\.spotify\.com/(?:intl-\w+/)?track/([a-zA-Z0-9]+)"
@@ -27,8 +36,18 @@ SPOTIFY_COLLECTION_RE = re.compile(
 
 _EMBED_SCRIPT_RE = re.compile(r"<script[^>]*>({.*?})</script>", re.DOTALL)
 
+async def _search_with_timeout(query, node):
+    return await asyncio.wait_for(
+        wavelink.Playable.search(query, node=node),
+        timeout=SEARCH_TIMEOUT,
+    )
+
 
 async def _spotify_url_to_query(url: str) -> str | None:
+    cached = await spotify_cache_get(f"oembed:{url}")
+    if cached is not None:
+        return cached
+
     oembed_url = f"https://open.spotify.com/oembed?url={url}"
     ssl_ctx = ssl.create_default_context(cafile=certifi.where())
     connector = aiohttp.TCPConnector(ssl=ssl_ctx)
@@ -40,13 +59,23 @@ async def _spotify_url_to_query(url: str) -> str | None:
                     title = (data.get("title") or "").strip()
                     author = (data.get("author_name") or "").strip()
                     if title:
-                        return f"{author} - {title}" if author else title
+                        result = f"{author} - {title}" if author else title
+                        await spotify_cache_set(f"oembed:{url}", result)
+                        return result
+    except asyncio.TimeoutError:
+        logger.warning("Spotify oembed timeout: %s", url)
+    except aiohttp.ClientError as e:
+        logger.warning("Spotify oembed error: %s", e)
     except Exception:
-        pass
+        logger.exception("Spotify oembed unexpected error")
     return None
 
 
 async def _spotify_collection_tracks(url: str) -> list[dict] | None:
+    cached = await spotify_cache_get(f"collection:{url}")
+    if cached is not None:
+        return json.loads(cached)
+
     ssl_ctx = ssl.create_default_context(cafile=certifi.where())
     connector = aiohttp.TCPConnector(ssl=ssl_ctx)
     try:
@@ -58,6 +87,7 @@ async def _spotify_collection_tracks(url: str) -> list[dict] | None:
             )
             async with session.get(embed_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status != 200:
+                    logger.warning("Spotify embed status %s for %s", resp.status, url)
                     return None
                 html = await resp.text(encoding="utf-8")
                 for match in _EMBED_SCRIPT_RE.finditer(html):
@@ -89,11 +119,16 @@ async def _spotify_collection_tracks(url: str) -> list[dict] | None:
                                     "artist": artist_clean,
                                     "duration_ms": t.get("duration", 0),
                                 })
+                            await spotify_cache_set(f"collection:{url}", json.dumps(out))
                             return out
                     except json.JSONDecodeError:
                         continue
+    except asyncio.TimeoutError:
+        logger.warning("Spotify collection timeout: %s", url)
+    except aiohttp.ClientError as e:
+        logger.warning("Spotify collection error: %s", e)
     except Exception:
-        pass
+        logger.exception("Spotify collection unexpected error")
     return None
 
 
@@ -124,22 +159,33 @@ def _score_track(t: wavelink.Playable, orig_title: str, orig_artist: str, orig_d
     return score
 
 
-MIN_MATCH_SCORE = 6.0  # en dessous, on préfère prévenir plutôt que jouer n'importe quoi
+MIN_MATCH_SCORE = 6.0
 
 
 async def _search_best(query: str, title: str, artist: str, duration: int, node) -> wavelink.Playable | None:
     try:
-        result = await wavelink.Playable.search(query, node=node)
+        result = await _search_with_timeout(query, node)
         candidates = result if isinstance(result, list) else (
             result.tracks if isinstance(result, wavelink.Playlist) else [result] if result else []
         )
         if not candidates:
             return None
         best = max(candidates, key=lambda t: _score_track(t, title, artist, duration))
-        if _score_track(best, title, artist, duration) < MIN_MATCH_SCORE:
-            return None  # aucun candidat assez fiable, mieux vaut prévenir que jouer le mauvais morceau
+        best_score = _score_track(best, title, artist, duration)
+        logger.info(
+            "Spotify match: '%s - %s' (%dms) -> '%s - %s' (%dms) score=%.1f",
+            artist, title, duration,
+            best.author, best.title, best.length, best_score,
+        )
+        if best_score < MIN_MATCH_SCORE:
+            logger.info("Rejected (score %.1f < %.1f)", best_score, MIN_MATCH_SCORE)
+            return None
         return best
+    except asyncio.TimeoutError:
+        logger.warning("Search timeout for query: %s", query)
+        return None
     except Exception:
+        logger.exception("Search error for query: %s", query)
         return None
 
 
@@ -162,33 +208,125 @@ class MusicPlayer(wavelink.Player):
         self.now_playing_message: discord.Message | None = None
         self.text_channel: discord.TextChannel | None = None
         self._disconnect_task: asyncio.Task | None = None
-        self._current_view: "NowPlayingView | None" = None
+        self._current_view: "NowPlayingLayout | None" = None
+        self._np_refresh_task: asyncio.Task | None = None
+        self.theme_color: int = COLOR_NOW_PLAYING
 
 
 # ── Interactive Views ───────────────────────────────────────────────
 
-class NowPlayingView(discord.ui.View):
-    def __init__(self, player: MusicPlayer):
+TITLE_ID, PROGRESS_ID, LOOP_ID, META_ID, FOOTER_ID = 101, 102, 103, 104, 105
+
+
+def _progress_bar(current_ms: int, total_ms: int, length: int = 14) -> str:
+    if total_ms <= 0:
+        return "`🔴 LIVE`"
+    ratio = min(current_ms / total_ms, 1.0)
+    filled = min(round(ratio * length), length - 1)
+    bar = "▬" * filled + "🔘" + "▬" * (length - filled - 1)
+    return f"{bar}\n`[{_format_duration(current_ms)} / {_format_duration(total_ms)}]`"
+
+
+class NowPlayingLayout(discord.ui.LayoutView):
+    def __init__(self, player: "MusicPlayer"):
         super().__init__(timeout=300)
         self.player = player
-        self._update_loop_button()
 
-    def _update_loop_button(self):
-        labels = {None: "Loop Off", "track": "Loop Track", "queue": "Loop Queue"}
-        self.loop_button.label = labels.get(self.player.loop_mode, "Loop Off")
-        styles = {
-            None: discord.ButtonStyle.grey,
-            "track": discord.ButtonStyle.success,
-            "queue": discord.ButtonStyle.primary,
-        }
-        self.loop_button.style = styles.get(self.player.loop_mode, discord.ButtonStyle.grey)
-        self._update_pause_button()
+        self.pause_resume = discord.ui.Button(style=discord.ButtonStyle.secondary, emoji="⏸️", label="Pause", row=0)
+        self.pause_resume.callback = self._on_pause_resume
+        self.skip_button = discord.ui.Button(style=discord.ButtonStyle.primary, emoji="⏭️", label="Skip", row=0)
+        self.skip_button.callback = self._on_skip
+        self.stop_button = discord.ui.Button(style=discord.ButtonStyle.danger, emoji="⏹️", label="Stop", row=0)
+        self.stop_button.callback = self._on_stop
+        self.vol_down = discord.ui.Button(style=discord.ButtonStyle.secondary, emoji="🔉", label="Vol-", row=0)
+        self.vol_down.callback = self._on_vol_down
+        self.vol_up = discord.ui.Button(style=discord.ButtonStyle.secondary, emoji="🔊", label="Vol+", row=0)
+        self.vol_up.callback = self._on_vol_up
 
-    def _update_pause_button(self):
-        self.pause_resume.label = "Resume" if self.player.paused else "Pause"
-        self.pause_resume.style = discord.ButtonStyle.success if self.player.paused else discord.ButtonStyle.secondary
-        emoji = "▶️" if self.player.paused else "⏸️"
-        self.pause_resume.emoji = emoji
+        self.loop_button = discord.ui.Button(style=discord.ButtonStyle.secondary, emoji="🔁", label="Loop Off", row=1)
+        self.loop_button.callback = self._on_loop
+        self.queue_button = discord.ui.Button(style=discord.ButtonStyle.secondary, emoji="📋", label="Queue", row=1)
+        self.queue_button.callback = self._on_queue
+        self.shuffle_button = discord.ui.Button(style=discord.ButtonStyle.secondary, emoji="🔀", label="Shuffle", row=1)
+        self.shuffle_button.callback = self._on_shuffle
+        self.clear_button = discord.ui.Button(style=discord.ButtonStyle.danger, emoji="🗑️", label="Clear", row=1)
+        self.clear_button.callback = self._on_clear
+        self.favorite_button = discord.ui.Button(style=discord.ButtonStyle.success, emoji="❤️", label="Favorite", row=1)
+        self.favorite_button.callback = self._on_favorite
+
+        self.restart_button = discord.ui.Button(style=discord.ButtonStyle.secondary, emoji="🔄", label="Restart", row=2)
+        self.restart_button.callback = self._on_restart
+        self.theme_button = discord.ui.Button(style=discord.ButtonStyle.secondary, emoji="🎨", label="Theme", row=2)
+        self.theme_button.callback = self._on_theme
+        self.clean_button = discord.ui.Button(style=discord.ButtonStyle.secondary, emoji="🧹", label="Clean", row=2)
+        self.clean_button.callback = self._on_clean
+
+        row0 = discord.ui.ActionRow(self.pause_resume, self.skip_button, self.stop_button, self.vol_down, self.vol_up)
+        row1 = discord.ui.ActionRow(self.loop_button, self.queue_button, self.shuffle_button, self.clear_button, self.favorite_button)
+        row2 = discord.ui.ActionRow(self.restart_button, self.theme_button, self.clean_button)
+
+        track = player.current
+        thumb = discord.ui.Thumbnail(track.artwork) if track.artwork else discord.ui.Thumbnail("https://i.imgur.com/AfFp7pu.png")
+
+        self.title_display = discord.ui.TextDisplay(f"### [{track.title}]({track.uri})", id=TITLE_ID)
+        self.progress_display = discord.ui.TextDisplay(_progress_bar(player.position, track.length), id=PROGRESS_ID)
+        self.loop_display = discord.ui.TextDisplay(self._loop_line(), id=LOOP_ID)
+        self.meta_display = discord.ui.TextDisplay(self._meta_line(), id=META_ID)
+        self.footer_display = discord.ui.TextDisplay(self._footer_line(), id=FOOTER_ID)
+
+        section = discord.ui.Section(self.title_display, self.progress_display, self.loop_display, accessory=thumb)
+        self.container = discord.ui.Container(
+            section, discord.ui.Separator(), self.meta_display, discord.ui.Separator(),
+            self.footer_display, discord.ui.Separator(), row0, row1, row2,
+            accent_colour=self._paused_color() if player.paused else player.theme_color,
+        )
+        self.add_item(self.container)
+        self._update_disable_states()
+
+    def _loop_line(self) -> str:
+        return {"track": "🔂 Looping track", "queue": "🔁 Looping queue"}.get(self.player.loop_mode, "🔁 Loop off")
+
+    def _meta_line(self) -> str:
+        track = self.player.current
+        duration = _format_duration(track.length) if track.length else "LIVE"
+        return f"🎤 **{track.author}**  ·  ⏱️ `{duration}`  ·  🔊 `{self.player.volume}%`"
+
+    def _footer_line(self) -> str:
+        return f"-# Requested by {self._requester_name()}  ·  Queue: {len(self.player.queue)} track{'s' if len(self.player.queue) != 1 else ''}"
+
+    def _requester_name(self) -> str:
+        track = self.player.current
+        if not track:
+            return "quelqu'un"
+        requester = getattr(track, "requester", None)
+        if requester and self.player.guild:
+            member = self.player.guild.get_member(requester)
+            if member:
+                return member.display_name
+        return "quelqu'un"
+
+    def _paused_color(self) -> int:
+        c = self.player.theme_color
+        return ((c >> 1) & 0x7F7F7F) | 0x404040
+
+    def _update_disable_states(self):
+        has_current = self.player.current is not None
+        has_queue = not (not self.player.queue or self.player.queue.is_empty)
+        self.pause_resume.disabled = not has_current
+        self.skip_button.disabled = not has_current
+        self.stop_button.disabled = not has_current
+        self.shuffle_button.disabled = not has_queue
+        self.clear_button.disabled = not has_queue
+        self.favorite_button.disabled = not has_current
+        self.restart_button.disabled = not has_current
+        self.clean_button.disabled = not has_queue
+
+    def refresh(self):
+        self.progress_display.content = _progress_bar(self.player.position, self.player.current.length)
+        self.loop_display.content = self._loop_line()
+        self.meta_display.content = self._meta_line()
+        self.footer_display.content = self._footer_line()
+        self.container.accent_colour = self._paused_color() if self.player.paused else self.player.theme_color
 
     async def _check_voice(self, interaction: discord.Interaction) -> bool:
         if not interaction.user.voice or interaction.user.voice.channel != self.player.channel:
@@ -196,27 +334,23 @@ class NowPlayingView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="Pause", style=discord.ButtonStyle.secondary, emoji="⏸️", row=0)
-    async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _on_pause_resume(self, interaction: discord.Interaction):
         if not await self._check_voice(interaction):
             return
         if self.player.paused:
-            await self.player.resume()
-            await interaction.response.send_message("▶️ Resumed", ephemeral=True)
+            await self.player.pause(False)
+            self.refresh()
+            await interaction.response.edit_message(view=self)
+            await interaction.followup.send("▶️ Resumed", ephemeral=True)
         elif self.player.playing:
-            await self.player.pause()
-            await interaction.response.send_message("⏸️ Paused", ephemeral=True)
+            await self.player.pause(True)
+            self.refresh()
+            await interaction.response.edit_message(view=self)
+            await interaction.followup.send("⏸️ Paused", ephemeral=True)
         else:
             await interaction.response.send_message("Nothing is playing.", ephemeral=True)
-        self._update_pause_button()
-        if self.player.now_playing_message:
-            try:
-                await self.player.now_playing_message.edit(view=self)
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                pass
 
-    @discord.ui.button(label="Skip", style=discord.ButtonStyle.primary, emoji="⏭️", row=0)
-    async def skip_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _on_skip(self, interaction: discord.Interaction):
         if not await self._check_voice(interaction):
             return
         if not self.player.current:
@@ -224,63 +358,51 @@ class NowPlayingView(discord.ui.View):
         await self.player.skip()
         await interaction.response.send_message("⏭️ Skipped", ephemeral=True)
 
-    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger, emoji="⏹️", row=0)
-    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _on_stop(self, interaction: discord.Interaction):
         if not await self._check_voice(interaction):
             return
         if not self.player.current:
             return await interaction.response.send_message("Nothing to stop.", ephemeral=True)
         self.player.queue.clear()
         await self.player.stop()
-        if self.player.now_playing_message:
-            try:
-                await self.player.now_playing_message.delete()
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                pass
-            self.player.now_playing_message = None
         await interaction.response.send_message("⏹️ Stopped", ephemeral=True)
 
-    @discord.ui.button(label="Vol-", style=discord.ButtonStyle.grey, emoji="🔉", row=0)
-    async def vol_down(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _on_vol_down(self, interaction: discord.Interaction):
         if not await self._check_voice(interaction):
             return
         new_vol = max(10, self.player.volume - 10)
         await self.player.set_volume(new_vol)
-        await interaction.response.send_message(f"🔉 Volume {new_vol // 10}%", ephemeral=True)
+        self.refresh()
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send(f"🔉 Volume {new_vol}%", ephemeral=True)
 
-    @discord.ui.button(label="Vol+", style=discord.ButtonStyle.grey, emoji="🔊", row=0)
-    async def vol_up(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _on_vol_up(self, interaction: discord.Interaction):
         if not await self._check_voice(interaction):
             return
-        new_vol = min(1000, self.player.volume + 10)
+        new_vol = min(100, self.player.volume + 10)
         await self.player.set_volume(new_vol)
-        await interaction.response.send_message(f"🔊 Volume {new_vol // 10}%", ephemeral=True)
+        self.refresh()
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send(f"🔊 Volume {new_vol}%", ephemeral=True)
 
-    @discord.ui.button(label="Loop Off", style=discord.ButtonStyle.grey, emoji="🔁", row=1)
-    async def loop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _on_loop(self, interaction: discord.Interaction):
         if not await self._check_voice(interaction):
             return
         order = [None, "track", "queue"]
         idx = (order.index(self.player.loop_mode) + 1) % len(order)
         self.player.loop_mode = order[idx]
-        self._update_loop_button()
+        self.refresh()
         labels = {None: "🔁 Loop off", "track": "🔂 Looping track", "queue": "🔁 Looping queue"}
-        await interaction.response.send_message(labels[self.player.loop_mode], ephemeral=True)
-        if self.player.now_playing_message:
-            try:
-                await self.player.now_playing_message.edit(view=self)
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                pass
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send(labels[self.player.loop_mode], ephemeral=True)
 
-    @discord.ui.button(label="Queue", style=discord.ButtonStyle.grey, emoji="📋", row=1)
-    async def queue_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = create_queue_embed(self.player)
+    async def _on_queue(self, interaction: discord.Interaction):
+        embed = create_queue_embed(self.player, color=self.player.theme_color)
         if not embed:
             return await interaction.response.send_message("Queue is empty.", ephemeral=True)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @discord.ui.button(label="Shuffle", style=discord.ButtonStyle.grey, emoji="🔀", row=1)
-    async def shuffle_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _on_shuffle(self, interaction: discord.Interaction):
         if not await self._check_voice(interaction):
             return
         if not self.player.queue or self.player.queue.is_empty:
@@ -288,17 +410,17 @@ class NowPlayingView(discord.ui.View):
         self.player.queue.shuffle()
         await interaction.response.send_message("🔀 Queue shuffled", ephemeral=True)
 
-    @discord.ui.button(label="Clear", style=discord.ButtonStyle.danger, emoji="🗑️", row=1)
-    async def clear_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _on_clear(self, interaction: discord.Interaction):
         if not await self._check_voice(interaction):
             return
         if not self.player.queue or self.player.queue.is_empty:
             return await interaction.response.send_message("Queue is already empty.", ephemeral=True)
         self.player.queue.clear()
-        await interaction.response.send_message("🗑️ Queue cleared", ephemeral=True)
+        self.refresh()
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send("🗑️ Queue cleared", ephemeral=True)
 
-    @discord.ui.button(label="Favorite", style=discord.ButtonStyle.success, emoji="❤️", row=1)
-    async def favorite_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _on_favorite(self, interaction: discord.Interaction):
         if not await self._check_voice(interaction):
             return
         track = self.player.current
@@ -310,6 +432,71 @@ class NowPlayingView(discord.ui.View):
             await interaction.response.send_message(f"❤️ Saved **{track.title}** to favorites", ephemeral=True)
         except Exception as e:
             await interaction.response.send_message(f"Error: {e}", ephemeral=True)
+
+    async def _on_restart(self, interaction: discord.Interaction):
+        if not await self._check_voice(interaction):
+            return
+        if not self.player.current or not self.player.current.length:
+            return await interaction.response.send_message("Nothing to restart.", ephemeral=True)
+        await self.player.seek(0)
+        await interaction.response.send_message("🔄 Restarted", ephemeral=True)
+
+    async def _on_theme(self, interaction: discord.Interaction):
+        cog = interaction.client.get_cog("MusicCog")
+        if cog and not await cog._check_dj(interaction):
+            return await interaction.response.send_message("You need the DJ role for this.", ephemeral=True)
+        presets = ["#6C5CE7", "#FF5733", "#33FF57", "#3357FF", "#FF33F5", "#FFD733"]
+        current_hex = "#{:06x}".format(self.player.theme_color)
+        idx = presets.index(current_hex) + 1 if current_hex in presets else 0
+        if idx >= len(presets):
+            idx = 0
+        new_hex = presets[idx]
+        await set_guild_theme(interaction.guild_id, new_hex)
+        self.player.theme_color = int(new_hex.lstrip("#"), 16)
+        self.refresh()
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send(f"🎨 Theme → {new_hex}", ephemeral=True)
+
+    async def _on_clean(self, interaction: discord.Interaction):
+        cog = interaction.client.get_cog("MusicCog")
+        if cog and not await cog._check_dj(interaction):
+            return await interaction.response.send_message("You need the DJ role for this.", ephemeral=True)
+        if not self.player.queue or self.player.queue.is_empty:
+            return await interaction.response.send_message("Queue is empty.", ephemeral=True)
+        await interaction.response.defer()
+
+        all_tracks = list(self.player.queue)
+        self.player.queue.clear()
+        sem = asyncio.Semaphore(5)
+        removed = 0
+
+        async def _check(t: wavelink.Playable) -> wavelink.Playable | None:
+            nonlocal removed
+            async with sem:
+                try:
+                    result = await asyncio.wait_for(
+                        wavelink.Playable.search(t.uri, node=self.player.node),
+                        timeout=5.0,
+                    )
+                    if result:
+                        return t
+                except Exception:
+                    pass
+                removed += 1
+                return None
+
+        results = await asyncio.gather(*[_check(t) for t in all_tracks], return_exceptions=True)
+        for r in results:
+            if isinstance(r, wavelink.Playable):
+                self.player.queue.put(r)
+
+        if removed and self.player.guild:
+            cog = interaction.client.get_cog("MusicCog")
+            if cog:
+                await cog._persist_queue(self.player, self.player.guild.id)
+
+        msg = f"🧹 Removed **{removed}** invalid track{'s' if removed != 1 else ''}" if removed else "✅ All tracks are valid"
+        await interaction.followup.send(msg, ephemeral=True)
 
 
 class SearchSelectView(discord.ui.View):
@@ -378,7 +565,7 @@ class QueuePageView(discord.ui.View):
     async def _page_callback(self, interaction: discord.Interaction):
         page = int(self.page_select.values[0])
         self.current_page = page
-        embed = create_queue_embed(self.player, page=page)
+        embed = create_queue_embed(self.player, page=page, color=self.player.theme_color)
         await interaction.response.edit_message(embed=embed, view=self)
 
 
@@ -388,9 +575,111 @@ class MusicCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._skip_votes: dict[int, set[int]] = {}
+        self._reconnect_task: asyncio.Task | None = None
+        self._cache_cleanup_task: asyncio.Task | None = None
+        self._node: wavelink.Node | None = None
+
+    async def cog_load(self):
+        self._reconnect_task = asyncio.create_task(self._reconnect_loop())
+        self._cache_cleanup_task = asyncio.create_task(self._cache_cleanup_loop())
+
+    async def cog_unload(self):
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+        if self._cache_cleanup_task and not self._cache_cleanup_task.done():
+            self._cache_cleanup_task.cancel()
+
+    async def _reconnect_loop(self):
+        while True:
+            try:
+                await asyncio.sleep(30)
+                pool = wavelink.Pool
+                if not pool.nodes:
+                    continue
+                for node in pool.nodes.values():
+                    if node.status != wavelink.NodeStatus.CONNECTED:
+                        logger.warning("Node %s disconnected, reconnecting...", node.uri)
+                        try:
+                            await asyncio.wait_for(node.connect(), timeout=10.0)
+                            logger.info("Node %s reconnected", node.uri)
+                        except Exception as e:
+                            logger.error("Failed to reconnect node %s: %s", node.uri, e)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Reconnect loop error")
+
+    async def _cache_cleanup_loop(self):
+        while True:
+            try:
+                await asyncio.sleep(3600)
+                await spotify_cache_cleanup()
+                logger.info("Spotify cache cleaned")
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+
+    async def _persist_queue(self, player: MusicPlayer, guild_id: int):
+        if not player.queue or player.queue.is_empty:
+            await delete_queue_state(guild_id)
+            return
+        tracks = [
+            {"title": t.title, "uri": t.uri, "author": t.author, "duration": t.length, "requester": getattr(t, "requester", None)}
+            for t in list(player.queue)
+        ]
+        await save_queue_state(guild_id, tracks, 0, player.loop_mode)
+
+    async def _restore_queue(self, player: MusicPlayer, guild_id: int):
+        state = await load_queue_state(guild_id)
+        if not state or not state["tracks"]:
+            return
+        await delete_queue_state(guild_id)
+        tracks_data = state["tracks"]
+        player.loop_mode = state.get("loop_mode")
+
+        async def _resolve(t: dict) -> wavelink.Playable | None:
+            try:
+                result = await _search_with_timeout(t["uri"], player.node)
+                if isinstance(result, wavelink.Playlist):
+                    loaded = result.tracks
+                elif isinstance(result, list):
+                    loaded = result
+                elif result:
+                    loaded = [result]
+                else:
+                    return None
+                if loaded:
+                    track = loaded[0]
+                    if "requester" in t:
+                        track.requester = t["requester"]
+                    return track
+            except Exception:
+                pass
+            return None
+
+        resolved = await asyncio.gather(*[_resolve(t) for t in tracks_data], return_exceptions=True)
+        restored = 0
+        for r in resolved:
+            if isinstance(r, wavelink.Playable):
+                player.queue.put(r)
+                restored += 1
+
+        if restored and player.text_channel:
+            try:
+                await player.text_channel.send(f"🔄 Restored **{restored} tracks** from saved queue.")
+            except (discord.Forbidden, discord.HTTPException):
+                pass
 
     async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
-        print(f"Command error [{interaction.command.name if interaction.command else '?'}]: {error}")
+        if isinstance(error, app_commands.CommandOnCooldown):
+            msg = f"⏳ Slow down! Try again in {error.retry_after:.0f}s."
+            if not interaction.response.is_done():
+                await interaction.response.send_message(msg, ephemeral=True)
+            else:
+                await interaction.followup.send(msg, ephemeral=True)
+            return
+        logger.error("Command error [%s]: %s", interaction.command.name if interaction.command else "?", error)
         if not interaction.response.is_done():
             await interaction.response.send_message(f"Error: {error}", ephemeral=True)
         else:
@@ -400,13 +689,41 @@ class MusicCog(commands.Cog):
 
     async def _check_dj(self, interaction: discord.Interaction) -> bool:
         if DJ_ROLE_ID is None:
+            player = interaction.guild.voice_client
+            if player and player.current:
+                if not interaction.user.voice or not player.channel or interaction.user.voice.channel != player.channel:
+                    return False
             return True
-        if interaction.user.voice and interaction.user.voice.channel:
-            non_bots = [m for m in interaction.user.voice.channel.members if not m.bot]
-            if len(non_bots) <= 1:
-                return True
+        if interaction.user.voice:
+            player = interaction.guild.voice_client
+            if player and player.channel and interaction.user.voice.channel == player.channel:
+                listeners = [m for m in player.channel.members if not m.bot and not (m.voice and (m.voice.self_deaf or m.voice.deaf))]
+                if len(listeners) <= 1:
+                    return True
         role = interaction.guild.get_role(DJ_ROLE_ID)
-        return role is None or role in interaction.user.roles
+        if role is None:
+            return interaction.user.guild_permissions.manage_guild or interaction.user.guild_permissions.administrator
+        return role in interaction.user.roles
+
+    async def _require_player(self, interaction: discord.Interaction) -> MusicPlayer | None:
+        player = interaction.guild.voice_client
+        if not player:
+            await interaction.response.send_message("Not connected.", ephemeral=True)
+            return None
+        return player
+
+    async def _require_same_channel(self, interaction: discord.Interaction) -> MusicPlayer | None:
+        player = interaction.guild.voice_client
+        if not player:
+            await interaction.response.send_message("Not connected.", ephemeral=True)
+            return None
+        if not player.current:
+            await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+            return None
+        if not interaction.user.voice or interaction.user.voice.channel != player.channel:
+            await interaction.response.send_message("You must be in the same voice channel.", ephemeral=True)
+            return None
+        return player
 
     async def _ensure_voice(self, interaction: discord.Interaction) -> MusicPlayer | None:
         if not interaction.user.voice or not interaction.user.voice.channel:
@@ -425,6 +742,8 @@ class MusicCog(commands.Cog):
                 player.text_channel = mc if isinstance(mc, discord.TextChannel) else interaction.channel
             else:
                 player.text_channel = interaction.channel
+            theme_hex = await get_guild_theme(interaction.guild_id)
+            player.theme_color = int(theme_hex.lstrip("#"), 16)
             return player
 
         player = await channel.connect(cls=MusicPlayer)
@@ -434,6 +753,10 @@ class MusicCog(commands.Cog):
             player.text_channel = mc if isinstance(mc, discord.TextChannel) else interaction.channel
         else:
             player.text_channel = interaction.channel
+
+        theme_hex = await get_guild_theme(interaction.guild_id)
+        player.theme_color = int(theme_hex.lstrip("#"), 16)
+        asyncio.create_task(self._restore_queue(player, interaction.guild_id))
         return player
 
     # ── Disconnect timer ──────────────────────────────────────────
@@ -445,6 +768,9 @@ class MusicCog(commands.Cog):
         async def _timer():
             try:
                 await asyncio.sleep(300)
+                self._stop_np_refresh(player)
+                if player.guild:
+                    await delete_queue_state(player.guild.id)
                 player.queue.clear()
                 if player.now_playing_message:
                     try:
@@ -463,11 +789,39 @@ class MusicCog(commands.Cog):
             player._disconnect_task.cancel()
             player._disconnect_task = None
 
+    # ── Now-playing auto-refresh ────────────────────────────────
+
+    def _start_np_refresh(self, player: MusicPlayer):
+        self._stop_np_refresh(player)
+        player._np_refresh_task = asyncio.create_task(self._np_refresh_loop(player))
+
+    def _stop_np_refresh(self, player: MusicPlayer):
+        if player._np_refresh_task and not player._np_refresh_task.done():
+            player._np_refresh_task.cancel()
+            player._np_refresh_task = None
+
+    async def _np_refresh_loop(self, player: MusicPlayer):
+        try:
+            while True:
+                await asyncio.sleep(15)
+                if not player.current or not player.now_playing_message:
+                    break
+                if not isinstance(player._current_view, NowPlayingLayout):
+                    break
+                player._current_view.refresh()
+                try:
+                    await player.now_playing_message.edit(view=player._current_view)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    break
+        except asyncio.CancelledError:
+            pass
+
     # ── Event listeners ───────────────────────────────────────────
 
     @commands.Cog.listener()
     async def on_wavelink_node_ready(self, payload: wavelink.NodeReadyEventPayload):
-        print(f"Lavalink node ready: {payload.node!r}")
+        self._node = payload.node
+        logger.info("Lavalink node ready: %s (session %s)", payload.node.uri, payload.session_id)
 
     @commands.Cog.listener()
     async def on_wavelink_track_start(self, payload: wavelink.TrackStartEventPayload):
@@ -475,24 +829,25 @@ class MusicCog(commands.Cog):
         if not player:
             return
 
-        embed = create_now_playing_embed(player)
-        if not embed or not player.text_channel:
+        if not player.text_channel:
             return
 
-        view = NowPlayingView(player)
+        view = NowPlayingLayout(player)
         player._current_view = view
 
         if player.now_playing_message:
             try:
-                await player.now_playing_message.edit(embed=embed, view=view)
+                await player.now_playing_message.edit(view=view)
                 return
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 pass
 
         try:
-            player.now_playing_message = await player.text_channel.send(embed=embed, view=view)
+            player.now_playing_message = await player.text_channel.send(view=view)
         except (discord.Forbidden, discord.HTTPException):
             pass
+
+        self._start_np_refresh(player)
 
     @commands.Cog.listener()
     async def on_wavelink_track_end(self, payload: wavelink.TrackEndEventPayload):
@@ -500,6 +855,7 @@ class MusicCog(commands.Cog):
         if not player:
             return
 
+        self._stop_np_refresh(player)
         self._skip_votes.pop(player.guild.id, None)
 
         reason = str(payload.reason)
@@ -515,9 +871,13 @@ class MusicCog(commands.Cog):
             if not player.queue.is_empty:
                 next_track = player.queue.get()
                 await player.play(next_track)
+            if player.guild:
+                await self._persist_queue(player, player.guild.id)
         elif not player.queue.is_empty:
             next_track = player.queue.get()
             await player.play(next_track)
+            if player.guild:
+                await self._persist_queue(player, player.guild.id)
         else:
             if player.now_playing_message:
                 try:
@@ -525,12 +885,16 @@ class MusicCog(commands.Cog):
                 except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                     pass
                 player.now_playing_message = None
+            if player.guild:
+                await delete_queue_state(player.guild.id)
 
     @commands.Cog.listener()
     async def on_wavelink_track_exception(self, payload: wavelink.TrackExceptionEventPayload):
         player: MusicPlayer | None = payload.player
         if not player:
             return
+
+        self._stop_np_refresh(player)
 
         if player.text_channel:
             try:
@@ -562,6 +926,8 @@ class MusicCog(commands.Cog):
 
     @app_commands.command(name="play", description="Play a song or add it to the queue")
     @app_commands.describe(query="Song name or URL (YouTube, SoundCloud, Spotify)")
+    @app_commands.guild_only()
+    @app_commands.checks.cooldown(1, 3.0, key=lambda i: i.user.id)
     async def play(self, interaction: discord.Interaction, query: str):
         await interaction.response.defer()
 
@@ -590,15 +956,6 @@ class MusicCog(commands.Cog):
                     duration = item["duration_ms"]
                     search_query = f"{artist} - {title}"
                     best = await _search_best(search_query, title, artist, duration, player.node)
-                    # DEBUG temporaire : compare ce qui a été lu sur Spotify vs trouvé sur YouTube
-                    if best:
-                        print(
-                            f"[SPOTIFY MATCH] Spotify: '{artist} - {title}' ({duration}ms) "
-                            f"-> YouTube: '{best.author} - {best.title}' ({best.length}ms) "
-                            f"score={_score_track(best, title, artist, duration):.1f}"
-                        )
-                    else:
-                        print(f"[SPOTIFY MATCH] Spotify: '{artist} - {title}' ({duration}ms) -> AUCUN candidat retenu")
                     if best:
                         best.requester = interaction.user.id
                     return best
@@ -623,6 +980,7 @@ class MusicCog(commands.Cog):
                 await interaction.followup.send(
                     f"✅ Added **{added}** tracks to the queue."
                 )
+            await self._persist_queue(player, interaction.guild_id)
             return
 
         # --- Spotify single track ---
@@ -652,17 +1010,18 @@ class MusicCog(commands.Cog):
                 await interaction.followup.send(
                     f"▶️ Now playing: **[{track.title}]({track.uri})**"
                 )
+            await self._persist_queue(player, interaction.guild_id)
             return
 
         # --- Direct URL auto-play (YouTube, SoundCloud) ---
         if query.startswith(("http://", "https://")):
-            result = await wavelink.Playable.search(query, node=player.node)
+            result = await _search_with_timeout(query, node=player.node)
             if not result:
                 return await interaction.followup.send("No results found.", ephemeral=True)
 
             if isinstance(result, wavelink.Playlist):
-                result.track_extras(requester=interaction.user.id)
                 for track in result:
+                    track.requester = interaction.user.id
                     player.queue.put(track)
                 if not player.current:
                     first = player.queue.get()
@@ -674,6 +1033,7 @@ class MusicCog(commands.Cog):
                     await interaction.followup.send(
                         f"Added **{len(result)} tracks** from playlist to queue."
                     )
+                await self._persist_queue(player, interaction.guild_id)
                 return
 
             track = result[0] if isinstance(result, list) else result
@@ -690,10 +1050,11 @@ class MusicCog(commands.Cog):
                 await interaction.followup.send(
                     f"▶️ Now playing: **[{track.title}]({track.uri})**"
                 )
+            await self._persist_queue(player, interaction.guild_id)
             return
 
         # --- Text query: show search select ---
-        result = await wavelink.Playable.search(query, node=player.node)
+        result = await _search_with_timeout(query, node=player.node)
         if not result:
             return await interaction.followup.send("No results found.", ephemeral=True)
 
@@ -717,41 +1078,46 @@ class MusicCog(commands.Cog):
                 await interaction.followup.send(
                     f"▶️ Now playing: **[{track.title}]({track.uri})**"
                 )
+            await self._persist_queue(player, interaction.guild_id)
             return
 
         view = SearchSelectView(tracks[:5], player, interaction.user.id)
-        embed = discord.Embed(
+        embed = build_embed(
             title="Search Results",
             description="Select a track to play:",
-            color=ACCENT,
         )
         await interaction.followup.send(embed=embed, view=view)
 
     # ── Transport commands ────────────────────────────────────────
 
     @app_commands.command(name="pause", description="Pause playback")
+    @app_commands.guild_only()
     async def pause(self, interaction: discord.Interaction):
-        player: MusicPlayer | None = interaction.guild.voice_client
-        if not player or not player.current:
-            return await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+        if not await self._require_same_channel(interaction):
+            return
+        player = interaction.guild.voice_client
         if player.paused:
             return await interaction.response.send_message("Already paused.", ephemeral=True)
-        await player.pause()
+        await player.pause(True)
         await interaction.response.send_message("Paused ⏸️")
 
     @app_commands.command(name="resume", description="Resume playback")
+    @app_commands.guild_only()
     async def resume(self, interaction: discord.Interaction):
-        player: MusicPlayer | None = interaction.guild.voice_client
-        if not player or not player.paused:
+        if not await self._require_same_channel(interaction):
+            return
+        player = interaction.guild.voice_client
+        if not player.paused:
             return await interaction.response.send_message("Nothing is paused.", ephemeral=True)
-        await player.resume()
+        await player.pause(False)
         await interaction.response.send_message("Resumed ▶️")
 
     @app_commands.command(name="skip", description="Skip to the next track")
+    @app_commands.guild_only()
     async def skip(self, interaction: discord.Interaction):
-        player: MusicPlayer | None = interaction.guild.voice_client
-        if not player or not player.current:
-            return await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+        if not await self._require_same_channel(interaction):
+            return
+        player = interaction.guild.voice_client
 
         # DJ bypass
         if await self._check_dj(interaction):
@@ -766,8 +1132,8 @@ class MusicCog(commands.Cog):
             return await interaction.response.send_message("You already voted to skip.", ephemeral=True)
 
         guild_votes.add(interaction.user.id)
-        non_bots = [m for m in player.channel.members if not m.bot]
-        required = math.ceil(len(non_bots) / 2)
+        listeners = [m for m in player.channel.members if not m.bot and not (m.voice and (m.voice.self_deaf or m.voice.deaf))]
+        required = math.ceil(len(listeners) / 2)
 
         if len(guild_votes) >= required:
             self._skip_votes.pop(interaction.guild_id, None)
@@ -780,12 +1146,13 @@ class MusicCog(commands.Cog):
 
     @app_commands.command(name="skipto", description="Skip to a specific position in the queue")
     @app_commands.describe(position="Track number to skip to")
+    @app_commands.guild_only()
     async def skipto(self, interaction: discord.Interaction, position: int):
+        if not await self._require_player(interaction):
+            return
         if not await self._check_dj(interaction):
             return await interaction.response.send_message("You need the DJ role for this.", ephemeral=True)
-        player: MusicPlayer | None = interaction.guild.voice_client
-        if not player or not player.current:
-            return await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+        player = interaction.guild.voice_client
         if player.queue.is_empty:
             return await interaction.response.send_message("Queue is empty.", ephemeral=True)
         if position < 1 or position > len(player.queue):
@@ -800,10 +1167,11 @@ class MusicCog(commands.Cog):
 
     @app_commands.command(name="seek", description="Seek to a position in the current track")
     @app_commands.describe(time="Position (e.g. 1:30 or 90 for seconds)")
+    @app_commands.guild_only()
     async def seek(self, interaction: discord.Interaction, time: str):
-        player: MusicPlayer | None = interaction.guild.voice_client
-        if not player or not player.current:
-            return await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+        if not await self._require_same_channel(interaction):
+            return
+        player = interaction.guild.voice_client
         if not player.current.length:
             return await interaction.response.send_message("Cannot seek on a live stream.", ephemeral=True)
 
@@ -825,12 +1193,13 @@ class MusicCog(commands.Cog):
         await interaction.response.send_message(f"⏩ Seeking to {_format_duration(seconds * 1000)}")
 
     @app_commands.command(name="stop", description="Stop playback and clear queue")
+    @app_commands.guild_only()
     async def stop(self, interaction: discord.Interaction):
+        if not await self._require_player(interaction):
+            return
         if not await self._check_dj(interaction):
             return await interaction.response.send_message("You need the DJ role for this.", ephemeral=True)
-        player: MusicPlayer | None = interaction.guild.voice_client
-        if not player or not player.current:
-            return await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+        player = interaction.guild.voice_client
         player.queue.clear()
         await player.stop()
         if player.now_playing_message:
@@ -839,33 +1208,45 @@ class MusicCog(commands.Cog):
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 pass
             player.now_playing_message = None
+        await delete_queue_state(interaction.guild_id)
         await interaction.response.send_message("Stopped ⏹️")
 
     @app_commands.command(name="volume", description="Set volume (0-100)")
     @app_commands.describe(volume="Volume level (0-100)")
+    @app_commands.guild_only()
     async def volume(self, interaction: discord.Interaction, volume: int):
+        if not await self._require_player(interaction):
+            return
         if not await self._check_dj(interaction):
             return await interaction.response.send_message("You need the DJ role for this.", ephemeral=True)
         if volume < 0 or volume > 100:
             return await interaction.response.send_message("Must be 0-100.", ephemeral=True)
-        player: MusicPlayer | None = interaction.guild.voice_client
-        if not player:
-            return await interaction.response.send_message("Not connected.", ephemeral=True)
-        await player.set_volume(volume * 10)
+        player = interaction.guild.voice_client
+        await player.set_volume(volume)
         await interaction.response.send_message(f"Volume → {volume}%")
 
     @app_commands.command(name="nowplaying", description="Show current track")
+    @app_commands.guild_only()
     async def nowplaying(self, interaction: discord.Interaction):
-        player: MusicPlayer | None = interaction.guild.voice_client
-        if not player or not player.current:
-            return await interaction.response.send_message("Nothing is playing.", ephemeral=True)
-        embed = create_now_playing_embed(player)
-        if embed:
-            await interaction.response.send_message(embed=embed)
-        else:
-            await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+        if not await self._require_same_channel(interaction):
+            return
+        player = interaction.guild.voice_client
+        view = NowPlayingLayout(player)
+        await interaction.response.send_message(view=view)
+
+    @app_commands.command(name="restart", description="Restart the current track from the beginning")
+    @app_commands.guild_only()
+    async def restart(self, interaction: discord.Interaction):
+        if not await self._require_same_channel(interaction):
+            return
+        player = interaction.guild.voice_client
+        if not player.current.length:
+            return await interaction.response.send_message("Cannot restart a live stream.", ephemeral=True)
+        await player.seek(0)
+        await interaction.response.send_message("🔄 Restarted from the beginning")
 
     @app_commands.command(name="queue", description="Show the queue")
+    @app_commands.guild_only()
     async def queue_cmd(self, interaction: discord.Interaction):
         player: MusicPlayer | None = interaction.guild.voice_client
         if not player:
@@ -874,29 +1255,35 @@ class MusicCog(commands.Cog):
             return await interaction.response.send_message("Queue is empty.", ephemeral=True)
 
         total_pages = max(1, math.ceil(len(player.queue) / 10))
-        embed = create_queue_embed(player, page=1)
+        embed = create_queue_embed(player, page=1, color=player.theme_color)
         view = QueuePageView(player, total_pages) if total_pages > 1 else None
         await interaction.response.send_message(embed=embed, view=view)
 
     # ── Queue management ──────────────────────────────────────────
 
     @app_commands.command(name="shuffle", description="Shuffle the queue")
+    @app_commands.guild_only()
     async def shuffle(self, interaction: discord.Interaction):
+        if not await self._require_player(interaction):
+            return
         if not await self._check_dj(interaction):
             return await interaction.response.send_message("You need the DJ role for this.", ephemeral=True)
-        player: MusicPlayer | None = interaction.guild.voice_client
-        if not player or player.queue.is_empty:
+        player = interaction.guild.voice_client
+        if player.queue.is_empty:
             return await interaction.response.send_message("Queue is empty.", ephemeral=True)
         player.queue.shuffle()
         await interaction.response.send_message(f"🔀 Queue shuffled ({len(player.queue)} tracks)")
 
     @app_commands.command(name="remove", description="Remove a track from the queue")
     @app_commands.describe(position="Track number in the queue")
+    @app_commands.guild_only()
     async def remove(self, interaction: discord.Interaction, position: int):
+        if not await self._require_player(interaction):
+            return
         if not await self._check_dj(interaction):
             return await interaction.response.send_message("You need the DJ role for this.", ephemeral=True)
-        player: MusicPlayer | None = interaction.guild.voice_client
-        if not player or player.queue.is_empty:
+        player = interaction.guild.voice_client
+        if player.queue.is_empty:
             return await interaction.response.send_message("Queue is empty.", ephemeral=True)
         if position < 1 or position > len(player.queue):
             return await interaction.response.send_message(f"Position must be 1-{len(player.queue)}.", ephemeral=True)
@@ -906,10 +1293,11 @@ class MusicCog(commands.Cog):
         await interaction.response.send_message(f"Removed: **[{track.title}]({track.uri})**")
 
     @app_commands.command(name="loop", description="Toggle loop mode: off -> track -> queue")
+    @app_commands.guild_only()
     async def loop(self, interaction: discord.Interaction):
-        player: MusicPlayer | None = interaction.guild.voice_client
-        if not player:
-            return await interaction.response.send_message("Not connected.", ephemeral=True)
+        if not await self._require_same_channel(interaction):
+            return
+        player = interaction.guild.voice_client
 
         order = [None, "track", "queue"]
         idx = (order.index(player.loop_mode) + 1) % len(order)
@@ -918,18 +1306,62 @@ class MusicCog(commands.Cog):
         labels = {None: "🔁 Loop off", "track": "🔂 Looping track", "queue": "🔁 Looping queue"}
         await interaction.response.send_message(labels[player.loop_mode])
 
-        if player._current_view:
-            player._current_view._update_loop_button()
+        if isinstance(player._current_view, NowPlayingLayout):
+            player._current_view.refresh()
             if player.now_playing_message:
                 try:
                     await player.now_playing_message.edit(view=player._current_view)
                 except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                     pass
 
+    @app_commands.command(name="queueclean", description="Remove invalid tracks from the queue")
+    @app_commands.guild_only()
+    async def queueclean(self, interaction: discord.Interaction):
+        if not await self._require_player(interaction):
+            return
+        if not await self._check_dj(interaction):
+            return await interaction.response.send_message("You need the DJ role for this.", ephemeral=True)
+        player = interaction.guild.voice_client
+        if player.queue.is_empty:
+            return await interaction.response.send_message("Queue is empty.", ephemeral=True)
+        await interaction.response.defer()
+
+        all_tracks = list(player.queue)
+        player.queue.clear()
+        sem = asyncio.Semaphore(5)
+        removed = 0
+
+        async def _check(t: wavelink.Playable) -> wavelink.Playable | None:
+            nonlocal removed
+            async with sem:
+                try:
+                    result = await asyncio.wait_for(
+                        wavelink.Playable.search(t.uri, node=player.node),
+                        timeout=5.0,
+                    )
+                    if result:
+                        return t
+                except Exception:
+                    pass
+                removed += 1
+                return None
+
+        results = await asyncio.gather(*[_check(t) for t in all_tracks], return_exceptions=True)
+        for r in results:
+            if isinstance(r, wavelink.Playable):
+                player.queue.put(r)
+
+        if removed:
+            await self._persist_queue(player, interaction.guild_id)
+
+        msg = f"🧹 Removed **{removed}** invalid track{'s' if removed != 1 else ''}" if removed else "✅ All tracks are valid"
+        await interaction.followup.send(msg)
+
     # ── Music channel ─────────────────────────────────────────────
 
     @app_commands.command(name="setchannel", description="Set the dedicated music text channel")
     @app_commands.describe(channel="Text channel for now-playing messages (leave empty to reset)")
+    @app_commands.guild_only()
     async def setchannel(self, interaction: discord.Interaction, channel: discord.TextChannel | None = None):
         await set_music_channel(interaction.guild_id, channel.id if channel else None)
         if channel:
@@ -937,15 +1369,59 @@ class MusicCog(commands.Cog):
         else:
             await interaction.response.send_message("✅ Music channel reset (uses command channel)")
 
+    @app_commands.command(name="theme", description="Change the accent color")
+    @app_commands.describe(color="Hex color (e.g. #FF5733) or reset to default")
+    @app_commands.guild_only()
+    async def theme(self, interaction: discord.Interaction, color: str | None = None):
+        if not await self._check_dj(interaction):
+            return await interaction.response.send_message("You need the DJ role for this.", ephemeral=True)
+
+        if color is None or color.lower() in ("reset", "default"):
+            color_hex = "#6C5CE7"
+            await set_guild_theme(interaction.guild_id, color_hex)
+            player: MusicPlayer | None = interaction.guild.voice_client
+            if player:
+                player.theme_color = int(color_hex.lstrip("#"), 16)
+                if isinstance(player._current_view, NowPlayingLayout):
+                    player._current_view.refresh()
+                    if player.now_playing_message:
+                        try:
+                            await player.now_playing_message.edit(view=player._current_view)
+                        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                            pass
+            return await interaction.response.send_message("✅ Theme reset to default")
+
+        color_hex = color.strip()
+        if not color_hex.startswith("#") or len(color_hex) != 7:
+            return await interaction.response.send_message("Invalid format. Use `#RRGGBB` (e.g. `#FF5733`)", ephemeral=True)
+        try:
+            int(color_hex[1:], 16)
+        except ValueError:
+            return await interaction.response.send_message("Invalid hex color.", ephemeral=True)
+
+        await set_guild_theme(interaction.guild_id, color_hex)
+        player: MusicPlayer | None = interaction.guild.voice_client
+        if player:
+            player.theme_color = int(color_hex.lstrip("#"), 16)
+            if isinstance(player._current_view, NowPlayingLayout):
+                player._current_view.refresh()
+                if player.now_playing_message:
+                    try:
+                        await player.now_playing_message.edit(view=player._current_view)
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        pass
+        await interaction.response.send_message(f"✅ Theme changed to {color_hex}")
+
     # ── Audio filters ─────────────────────────────────────────────
 
     @app_commands.command(name="bassboost", description="Enable bass boost")
+    @app_commands.guild_only()
     async def bassboost(self, interaction: discord.Interaction):
+        if not await self._require_player(interaction):
+            return
         if not await self._check_dj(interaction):
             return await interaction.response.send_message("You need the DJ role for this.", ephemeral=True)
-        player: MusicPlayer | None = interaction.guild.voice_client
-        if not player:
-            return await interaction.response.send_message("Not connected.", ephemeral=True)
+        player = interaction.guild.voice_client
 
         filters = wavelink.Filters()
         filters.equalizer = wavelink.Equalizer(payload=[(0, 0.2), (1, 0.15), (2, 0.1), (3, 0.05)])
@@ -953,12 +1429,13 @@ class MusicCog(commands.Cog):
         await interaction.response.send_message("✅ Bass boost enabled")
 
     @app_commands.command(name="nightcore", description="Enable nightcore effect")
+    @app_commands.guild_only()
     async def nightcore(self, interaction: discord.Interaction):
+        if not await self._require_player(interaction):
+            return
         if not await self._check_dj(interaction):
             return await interaction.response.send_message("You need the DJ role for this.", ephemeral=True)
-        player: MusicPlayer | None = interaction.guild.voice_client
-        if not player:
-            return await interaction.response.send_message("Not connected.", ephemeral=True)
+        player = interaction.guild.voice_client
 
         filters = wavelink.Filters()
         filters.timescale = wavelink.Timescale(payload={"pitch": 1.2, "speed": 1.2})
@@ -966,12 +1443,13 @@ class MusicCog(commands.Cog):
         await interaction.response.send_message("✅ Nightcore enabled")
 
     @app_commands.command(name="reset", description="Reset all audio filters")
+    @app_commands.guild_only()
     async def reset(self, interaction: discord.Interaction):
+        if not await self._require_player(interaction):
+            return
         if not await self._check_dj(interaction):
             return await interaction.response.send_message("You need the DJ role for this.", ephemeral=True)
-        player: MusicPlayer | None = interaction.guild.voice_client
-        if not player:
-            return await interaction.response.send_message("Not connected.", ephemeral=True)
+        player = interaction.guild.voice_client
 
         await player.set_filters(wavelink.Filters())
         await interaction.response.send_message("✅ Filters reset")
@@ -980,13 +1458,21 @@ class MusicCog(commands.Cog):
 
     @app_commands.command(name="save", description="Save current queue as a playlist")
     @app_commands.describe(name="Playlist name")
+    @app_commands.guild_only()
     async def save(self, interaction: discord.Interaction, name: str):
         player: MusicPlayer | None = interaction.guild.voice_client
-        if not player or player.queue.is_empty:
+        if not player or (not player.current and player.queue.is_empty):
             return await interaction.response.send_message("Queue is empty.", ephemeral=True)
 
-        track_data = [
-            {"title": t.title, "uri": t.uri, "author": t.author, "duration": t.length}
+        track_data = []
+        if player.current:
+            track_data.append({
+                "title": player.current.title, "uri": player.current.uri,
+                "author": player.current.author, "duration": player.current.length,
+                "requester": getattr(player.current, "requester", None),
+            })
+        track_data += [
+            {"title": t.title, "uri": t.uri, "author": t.author, "duration": t.length, "requester": getattr(t, "requester", None)}
             for t in player.queue.copy()
         ]
 
@@ -998,6 +1484,7 @@ class MusicCog(commands.Cog):
 
     @app_commands.command(name="playlist", description="Load a saved playlist")
     @app_commands.describe(name="Playlist name")
+    @app_commands.guild_only()
     async def playlist(self, interaction: discord.Interaction, name: str):
         await interaction.response.defer()
 
@@ -1032,7 +1519,10 @@ class MusicCog(commands.Cog):
         else:
             await interaction.followup.send("Could not load any tracks from the playlist.", ephemeral=True)
 
+        await self._persist_queue(player, interaction.guild_id)
+
     @app_commands.command(name="pl_list", description="List your saved playlists")
+    @app_commands.guild_only()
     async def pl_list(self, interaction: discord.Interaction):
         playlists_data = await list_playlists(interaction.user.id)
         if not playlists_data:
@@ -1042,16 +1532,17 @@ class MusicCog(commands.Cog):
         for p in playlists_data:
             lines.append(f"**{p['name']}** — {p['track_count']} tracks ({p['created_at'][:10]})")
 
-        embed = discord.Embed(
+        embed = build_embed(
+            type="info",
             title="Your playlists",
             description="\n".join(lines),
-            color=discord.Color.blurple(),
+            footer_text=f"{len(playlists_data)} playlist(s)",
         )
-        embed.set_footer(text=f"{len(playlists_data)} playlist(s)")
         await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="pl_delete", description="Delete a saved playlist")
     @app_commands.describe(name="Playlist name")
+    @app_commands.guild_only()
     async def pl_delete(self, interaction: discord.Interaction, name: str):
         deleted = await delete_playlist(interaction.user.id, name)
         if deleted:

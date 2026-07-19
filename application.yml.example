@@ -4,7 +4,7 @@ server:
 
 lavalink:
   server:
-    password: "youshallnotpass"
+    password: "${LAVALINK_PASSWORD}"
     bufferDurationMs: 400
     sources:
       youtube: false
@@ -24,11 +24,6 @@ plugins:
     providers:
       - "ytsearch:\"%ISRC%\""
       - "ytsearch:%QUERY%"
-    # Non utilisé : ton code résout les liens Spotify par scraping des pages
-    # publiques (utils/music.py: _spotify_url_to_query / _spotify_collection_tracks),
-    # pas via l'API officielle. Ces credentials ne servent donc à rien tant que
-    # tu n'actives pas explicitement wavelink.Playable.search("spotify:...").
-    # Laisse "spotify: false" pour éviter d'exposer un Client ID/Secret pour rien.
     spotify:
       clientId: ""
       clientSecret: ""

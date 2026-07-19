@@ -1,16 +1,22 @@
+import json
+import time
+
 import aiosqlite
 from config import DATABASE_PATH
 
 
 async def _connect(db):
-    """SQLite n'applique pas les foreign keys (donc les ON DELETE CASCADE)
-    par défaut : il faut l'activer explicitement à chaque connexion."""
     await db.execute("PRAGMA foreign_keys = ON")
+    await db.execute("PRAGMA journal_mode = WAL")
 
 
 async def init_db():
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await _connect(db)
+        try:
+            await db.execute("ALTER TABLE guild_settings ADD COLUMN theme_color TEXT DEFAULT '#6C5CE7'")
+        except Exception:
+            pass
         await db.executescript("""
             CREATE TABLE IF NOT EXISTS playlists (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -31,7 +37,20 @@ async def init_db():
             );
             CREATE TABLE IF NOT EXISTS guild_settings (
                 guild_id INTEGER PRIMARY KEY,
-                channel_id INTEGER
+                channel_id INTEGER,
+                theme_color TEXT DEFAULT '#6C5CE7'
+            );
+            CREATE TABLE IF NOT EXISTS spotify_cache (
+                cache_key TEXT PRIMARY KEY,
+                data TEXT NOT NULL,
+                expires_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS queue_state (
+                guild_id INTEGER PRIMARY KEY,
+                track_data TEXT NOT NULL,
+                position INTEGER NOT NULL DEFAULT 0,
+                loop_mode TEXT,
+                saved_at TEXT DEFAULT (datetime('now'))
             );
         """)
 
@@ -113,6 +132,27 @@ async def get_music_channel(guild_id: int) -> int | None:
         return row[0] if row else None
 
 
+async def set_guild_theme(guild_id: int, color_hex: str):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await _connect(db)
+        await db.execute(
+            "INSERT INTO guild_settings (guild_id, theme_color) VALUES (?, ?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET theme_color = ?",
+            (guild_id, color_hex, color_hex),
+        )
+        await db.commit()
+
+
+async def get_guild_theme(guild_id: int) -> str:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await _connect(db)
+        cursor = await db.execute(
+            "SELECT theme_color FROM guild_settings WHERE guild_id = ?", (guild_id,)
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else "#6C5CE7"
+
+
 async def append_to_playlist(user_id: int, name: str, tracks: list[dict]):
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await _connect(db)
@@ -148,10 +188,71 @@ async def append_to_playlist(user_id: int, name: str, tracks: list[dict]):
 
 async def delete_playlist(user_id: int, name: str) -> bool:
     async with aiosqlite.connect(DATABASE_PATH) as db:
-        await _connect(db)  # active ON DELETE CASCADE pour playlist_tracks
+        await _connect(db)
         cursor = await db.execute(
             "DELETE FROM playlists WHERE user_id = ? AND name = ?",
             (user_id, name),
         )
         await db.commit()
         return cursor.rowcount > 0
+
+
+async def save_queue_state(guild_id: int, tracks: list[dict], position: int, loop_mode: str | None):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "INSERT INTO queue_state (guild_id, track_data, position, loop_mode) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET track_data = ?, position = ?, loop_mode = ?, saved_at = datetime('now')",
+            (guild_id, json.dumps(tracks), position, loop_mode,
+             json.dumps(tracks), position, loop_mode),
+        )
+        await db.commit()
+
+
+async def load_queue_state(guild_id: int) -> dict | None:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            "SELECT track_data, position, loop_mode FROM queue_state WHERE guild_id = ?",
+            (guild_id,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        return {
+            "tracks": json.loads(row[0]),
+            "position": row[1],
+            "loop_mode": row[2],
+        }
+
+
+async def delete_queue_state(guild_id: int):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("DELETE FROM queue_state WHERE guild_id = ?", (guild_id,))
+        await db.commit()
+
+
+async def spotify_cache_get(key: str) -> str | None:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            "SELECT data FROM spotify_cache WHERE cache_key = ? AND expires_at > ?",
+            (key, time.time()),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+
+async def spotify_cache_set(key: str, data: str, ttl: int = 3600):
+    expires = time.time() + ttl
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "INSERT INTO spotify_cache (cache_key, data, expires_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(cache_key) DO UPDATE SET data = ?, expires_at = ?",
+            (key, data, expires, data, expires),
+        )
+        await db.commit()
+
+
+async def spotify_cache_cleanup():
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("DELETE FROM spotify_cache WHERE expires_at <= ?", (time.time(),))
+        await db.commit()

@@ -19,11 +19,9 @@ if %errorlevel% neq 0 (
     )
 )
 
-:: Check / set Discord token
-if "%DISCORD_TOKEN%"=="" (
-    if exist ".env" (
-        for /f "tokens=2 delims==" %%a in ('findstr /b "DISCORD_TOKEN" .env') do set "DISCORD_TOKEN=%%a"
-    )
+:: Load .env variables
+if exist ".env" (
+    for /f "usebackq tokens=1,* delims==" %%a in (".env") do set "%%a=%%b"
 )
 if "%DISCORD_TOKEN%"=="" (
     echo [ERREUR] DISCORD_TOKEN non defini. Cree un fichier .env avec :
@@ -31,6 +29,8 @@ if "%DISCORD_TOKEN%"=="" (
     pause
     exit /b 1
 )
+if "%LAVALINK_URI%"=="" set "LAVALINK_URI=http://localhost:2333"
+if "%LAVALINK_PASSWORD%"=="" set "LAVALINK_PASSWORD=youshallnotpass"
 
 :: Check Python
 where python >nul 2>&1
@@ -47,6 +47,10 @@ if %errorlevel% neq 0 (
     pause
     exit /b 1
 )
+
+:: Generate application.yml from template + .env
+echo [INFO] Generation de application.yml...
+python generate_yml.py
 
 :: Check Lavalink.jar
 if not exist "lavalink\Lavalink.jar" (

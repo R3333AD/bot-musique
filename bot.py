@@ -1,8 +1,16 @@
+import logging
+
 import discord
 from discord.ext import commands
 import wavelink
 from config import DISCORD_TOKEN, LAVALINK_URI, LAVALINK_PASSWORD
 from utils.db import init_db
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
 
 
 class Bot(commands.Bot):
