@@ -36,14 +36,26 @@ SPOTIFY_COLLECTION_RE = re.compile(
 
 _EMBED_SCRIPT_RE = re.compile(r"<script[^>]*>({.*?})</script>", re.DOTALL)
 
-async def _search_with_timeout(query, node):
+_SPOTIFY_INTL_PREFIX_RE = re.compile(r"^(https?://open\.spotify\.com/)intl-\w+/")
+
+
+def _normalize_spotify_url(url: str) -> str:
+    url = url.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    return _SPOTIFY_INTL_PREFIX_RE.sub(r"\1", url)
+
+
+async def _search_with_timeout(query, node, source=None):
+    kwargs = {"node": node}
+    if source is not None:
+        kwargs["source"] = source
     return await asyncio.wait_for(
-        wavelink.Playable.search(query, node=node),
+        wavelink.Playable.search(query, **kwargs),
         timeout=SEARCH_TIMEOUT,
     )
 
 
 async def _spotify_url_to_query(url: str) -> str | None:
+    url = _normalize_spotify_url(url)
     cached = await spotify_cache_get(f"oembed:{url}")
     if cached is not None:
         return cached
@@ -72,6 +84,7 @@ async def _spotify_url_to_query(url: str) -> str | None:
 
 
 async def _spotify_collection_tracks(url: str) -> list[dict] | None:
+    url = _normalize_spotify_url(url)
     cached = await spotify_cache_get(f"collection:{url}")
     if cached is not None:
         return json.loads(cached)
@@ -132,8 +145,25 @@ async def _spotify_collection_tracks(url: str) -> list[dict] | None:
     return None
 
 
+_JUNK_TITLE_RE = re.compile(
+    r"\b("
+    r"official\s*(music\s*)?(video|audio)|"
+    r"lyrics?(\s*video)?|"
+    r"visualizer|"
+    r"audio\s*only|"
+    r"full\s*song|"
+    r"hq|hd|4k"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _clean_title(text: str) -> str:
+    return re.sub(r"\s+", " ", _JUNK_TITLE_RE.sub("", text)).strip()
+
+
 def _score_track(t: wavelink.Playable, orig_title: str, orig_artist: str, orig_dur: int) -> float:
-    st, sa = t.title.lower(), t.author.lower()
+    st, sa = _clean_title(t.title).lower(), t.author.lower()
     ot, oa = orig_title.lower(), orig_artist.lower()
     score = 0.0
     for word in ot.split():
@@ -162,19 +192,44 @@ def _score_track(t: wavelink.Playable, orig_title: str, orig_artist: str, orig_d
 MIN_MATCH_SCORE = 6.0
 
 
+def _best_candidate(candidates: list, title: str, artist: str, duration: int):
+    if not candidates:
+        return None, 0.0
+    best = max(candidates, key=lambda t: _score_track(t, title, artist, duration))
+    return best, _score_track(best, title, artist, duration)
+
+
 async def _search_best(query: str, title: str, artist: str, duration: int, node) -> wavelink.Playable | None:
     try:
         result = await _search_with_timeout(query, node)
         candidates = result if isinstance(result, list) else (
             result.tracks if isinstance(result, wavelink.Playlist) else [result] if result else []
         )
-        if not candidates:
+        best, best_score = _best_candidate(candidates, title, artist, duration)
+        source = "YouTube"
+
+        if best is None or best_score < MIN_MATCH_SCORE:
+            try:
+                sc_result = await _search_with_timeout(
+                    query, node, source=wavelink.TrackSource.SoundCloud
+                )
+                sc_candidates = sc_result if isinstance(sc_result, list) else (
+                    sc_result.tracks if isinstance(sc_result, wavelink.Playlist) else [sc_result] if sc_result else []
+                )
+                sc_best, sc_score = _best_candidate(sc_candidates, title, artist, duration)
+                if sc_best is not None and sc_score > best_score:
+                    best, best_score, source = sc_best, sc_score, "SoundCloud"
+            except asyncio.TimeoutError:
+                logger.warning("SoundCloud fallback timeout for query: %s", query)
+            except Exception:
+                logger.exception("SoundCloud fallback error for query: %s", query)
+
+        if best is None:
             return None
-        best = max(candidates, key=lambda t: _score_track(t, title, artist, duration))
-        best_score = _score_track(best, title, artist, duration)
+
         logger.info(
-            "Spotify match: '%s - %s' (%dms) -> '%s - %s' (%dms) score=%.1f",
-            artist, title, duration,
+            "Spotify match [%s]: '%s - %s' (%dms) -> '%s - %s' (%dms) score=%.1f",
+            source, artist, title, duration,
             best.author, best.title, best.length, best_score,
         )
         if best_score < MIN_MATCH_SCORE:

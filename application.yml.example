@@ -22,11 +22,19 @@ lavalink:
 plugins:
   lavasrc:
     providers:
-      - "ytsearch:\"%ISRC%\""
-      - "ytsearch:%QUERY%"
+      # ISRC d'abord (matching quasi exact), puis recherche texte sur YouTube Music
+      # (meilleure qualité que ytsearch classique : versions studio prioritaires)
+      - "ytmsearch:\"%ISRC%\""
+      - "ytmsearch:%QUERY%"
+    # --- Spotify : nécessite un compte Spotify Premium depuis fév. 2026 ---
+    # Laisse vide et sources.spotify=false si tu n'as pas de compte Premium.
+    # Le bot utilise alors un fallback par scraping (déjà en place dans music.py),
+    # plus fragile mais qui ne demande aucun compte.
+    # Si tu as Premium : renseigne SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET dans
+    # .env et passe sources.spotify à true ci-dessous.
     spotify:
-      clientId: ""
-      clientSecret: ""
+      clientId: "${SPOTIFY_CLIENT_ID}"
+      clientSecret: "${SPOTIFY_CLIENT_SECRET}"
       countryCode: "FR"
     sources:
       spotify: false

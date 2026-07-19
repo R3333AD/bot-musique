@@ -25,6 +25,8 @@ def main():
 
     password = env.get("LAVALINK_PASSWORD", "youshallnotpass")
     content = content.replace("${LAVALINK_PASSWORD}", password)
+    content = content.replace("${SPOTIFY_CLIENT_ID}", env.get("SPOTIFY_CLIENT_ID", ""))
+    content = content.replace("${SPOTIFY_CLIENT_SECRET}", env.get("SPOTIFY_CLIENT_SECRET", ""))
 
     with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
         f.write(content)
