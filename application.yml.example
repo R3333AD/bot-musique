@@ -20,6 +20,16 @@ lavalink:
       repository: "https://maven.lavalink.dev/releases"
 
 plugins:
+  youtube:
+    enabled: true
+    clients:
+      # Ordre par fiabilité décroissante
+      - MUSIC
+      - ANDROID_MUSIC
+      - TV
+      - ANDROID_VR
+      - WEB
+      - WEB_EMBEDDED_PLAYER
   lavasrc:
     providers:
       # ISRC d'abord (matching quasi exact), puis recherche texte sur YouTube Music
