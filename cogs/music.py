@@ -83,65 +83,141 @@ async def _spotify_url_to_query(url: str) -> str | None:
     return None
 
 
+async def _spotify_get_access_token() -> str | None:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://open.spotify.com/get_access_token?reason=transport&productType=embed",
+                timeout=aiohttp.ClientTimeout(total=5),
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("accessToken")
+    except Exception as e:
+        logger.warning("Failed to get Spotify access token: %s", e)
+    return None
+
+
+async def _spotify_collection_from_api(entity_type: str, entity_id: str, session: aiohttp.ClientSession, token: str) -> list[dict] | None:
+    out = []
+    offset = 0
+    limit = 100
+    try:
+        while True:
+            api_url = f"https://api.spotify.com/v1/{entity_type}s/{entity_id}/tracks?limit={limit}&offset={offset}&market=US"
+            async with session.get(
+                api_url, timeout=aiohttp.ClientTimeout(total=10),
+                headers={"Authorization": f"Bearer {token}", "User-Agent": "Mozilla/5.0"},
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                items = data.get("items", [])
+                if not items:
+                    break
+                for item in items:
+                    track = item.get("track") if entity_type == "playlist" else item
+                    if not track:
+                        continue
+                    title = (track.get("name") or "").strip()
+                    if not title:
+                        continue
+                    artists = ", ".join(a.get("name", "") for a in track.get("artists", []))
+                    out.append({
+                        "title": title,
+                        "artist": artists,
+                        "duration_ms": track.get("duration_ms", 0),
+                    })
+                if len(items) < limit:
+                    break
+                offset += limit
+        return out if out else None
+    except Exception as e:
+        logger.warning("Spotify API pagination error: %s", e)
+        return None
+
+
+async def _spotify_collection_from_embed(url: str, session: aiohttp.ClientSession) -> list[dict] | None:
+    embed_url = re.sub(
+        r"https?://open\.spotify\.com/(?:intl-\w+/)?",
+        "https://open.spotify.com/embed/",
+        url,
+    )
+    try:
+        async with session.get(embed_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                return None
+            html = await resp.text(encoding="utf-8")
+            for match in _EMBED_SCRIPT_RE.finditer(html):
+                try:
+                    data = json.loads(match.group(1))
+                    entity = (
+                        data.get("props", {})
+                        .get("pageProps", {})
+                        .get("state", {})
+                        .get("data", {})
+                        .get("entity", {})
+                    )
+                    if entity.get("type") in ("playlist", "album"):
+                        out = []
+                        for t in entity.get("trackList", []):
+                            title = (t.get("title") or "").strip()
+                            if not title:
+                                continue
+                            artist = (t.get("subtitle") or "").strip()
+                            artist_clean = re.sub(r"[,\s]+", " ", artist).strip()
+                            title_clean = re.sub(
+                                r"\s*[([]([^)\]]*feat\.[^)\]]*|[^)\]]*remastered[^)\]]*|[^)\]]*remix[^)\]]*|[^)\]]*live[^)\]]*)[)\]]\s*",
+                                "",
+                                title,
+                                flags=re.IGNORECASE,
+                            ).strip()
+                            out.append({
+                                "title": title_clean,
+                                "artist": artist_clean,
+                                "duration_ms": t.get("duration", 0),
+                            })
+                        return out
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        pass
+    return None
+
+
 async def _spotify_collection_tracks(url: str) -> list[dict] | None:
     url = _normalize_spotify_url(url)
     cached = await spotify_cache_get(f"collection:{url}")
     if cached is not None:
         return json.loads(cached)
 
+    m = SPOTIFY_COLLECTION_RE.match(url)
+    if not m:
+        return None
+    entity_type = m.group(1)
+    entity_id = m.group(2)
+
     ssl_ctx = ssl.create_default_context(cafile=certifi.where())
     connector = aiohttp.TCPConnector(ssl=ssl_ctx)
-    try:
-        async with aiohttp.ClientSession(connector=connector) as session:
-            embed_url = re.sub(
-                r"https?://open\.spotify\.com/(?:intl-\w+/)?",
-                "https://open.spotify.com/embed/",
-                url,
-            )
-            async with session.get(embed_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status != 200:
-                    logger.warning("Spotify embed status %s for %s", resp.status, url)
-                    return None
-                html = await resp.text(encoding="utf-8")
-                for match in _EMBED_SCRIPT_RE.finditer(html):
-                    try:
-                        data = json.loads(match.group(1))
-                        entity = (
-                            data.get("props", {})
-                            .get("pageProps", {})
-                            .get("state", {})
-                            .get("data", {})
-                            .get("entity", {})
-                        )
-                        if entity.get("type") in ("playlist", "album"):
-                            out = []
-                            for t in entity.get("trackList", []):
-                                title = (t.get("title") or "").strip()
-                                if not title:
-                                    continue
-                                artist = (t.get("subtitle") or "").strip()
-                                artist_clean = re.sub(r"[,\s]+", " ", artist).strip()
-                                title_clean = re.sub(
-                                    r"\s*[([]([^)\]]*feat\.[^)\]]*|[^)\]]*remastered[^)\]]*|[^)\]]*remix[^)\]]*|[^)\]]*live[^)\]]*)[)\]]\s*",
-                                    "",
-                                    title,
-                                    flags=re.IGNORECASE,
-                                ).strip()
-                                out.append({
-                                    "title": title_clean,
-                                    "artist": artist_clean,
-                                    "duration_ms": t.get("duration", 0),
-                                })
-                            await spotify_cache_set(f"collection:{url}", json.dumps(out))
-                            return out
-                    except json.JSONDecodeError:
-                        continue
-    except asyncio.TimeoutError:
-        logger.warning("Spotify collection timeout: %s", url)
-    except aiohttp.ClientError as e:
-        logger.warning("Spotify collection error: %s", e)
-    except Exception:
-        logger.exception("Spotify collection unexpected error")
+
+    async with aiohttp.ClientSession(connector=connector) as session:
+        # Try API first (paginated = all tracks)
+        token = await _spotify_get_access_token()
+        if token:
+            out = await _spotify_collection_from_api(entity_type, entity_id, session, token)
+            if out:
+                logger.info("Spotify API fetched %d tracks for %s", len(out), url)
+                await spotify_cache_set(f"collection:{url}", json.dumps(out))
+                return out
+
+        # Fallback: embed page (limited to ~20 tracks)
+        out = await _spotify_collection_from_embed(url, session)
+        if out:
+            logger.info("Spotify embed fetched %d tracks for %s (API unavailable)", len(out), url)
+            await spotify_cache_set(f"collection:{url}", json.dumps(out))
+            return out
+
     return None
 
 
