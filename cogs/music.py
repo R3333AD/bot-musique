@@ -341,7 +341,10 @@ class MusicPlayer(wavelink.Player):
         self._disconnect_task: asyncio.Task | None = None
         self._current_view: "NowPlayingLayout | None" = None
         self._np_refresh_task: asyncio.Task | None = None
+        self._crossfade_task: asyncio.Task | None = None
         self.theme_color: int = COLOR_NOW_PLAYING
+        self.crossfade_duration: int = 0
+        self._base_volume: int = 100
 
 
 # ── Interactive Views ───────────────────────────────────────────────
@@ -494,6 +497,10 @@ class NowPlayingLayout(discord.ui.LayoutView):
             return
         if not self.player.current:
             return await interaction.response.send_message("Nothing to stop.", ephemeral=True)
+        if self.player._crossfade_task and not self.player._crossfade_task.done():
+            self.player._crossfade_task.cancel()
+        if self.player._np_refresh_task and not self.player._np_refresh_task.done():
+            self.player._np_refresh_task.cancel()
         self.player.queue.clear()
         await self.player.stop()
         await interaction.response.send_message("⏹️ Stopped", ephemeral=True)
@@ -502,6 +509,7 @@ class NowPlayingLayout(discord.ui.LayoutView):
         if not await self._check_voice(interaction):
             return
         new_vol = max(10, self.player.volume - 10)
+        self.player._base_volume = new_vol
         await self.player.set_volume(new_vol)
         self.refresh()
         await interaction.response.edit_message(view=self)
@@ -511,6 +519,7 @@ class NowPlayingLayout(discord.ui.LayoutView):
         if not await self._check_voice(interaction):
             return
         new_vol = min(100, self.player.volume + 10)
+        self.player._base_volume = new_vol
         await self.player.set_volume(new_vol)
         self.refresh()
         await interaction.response.edit_message(view=self)
@@ -900,6 +909,7 @@ class MusicCog(commands.Cog):
             try:
                 await asyncio.sleep(300)
                 self._stop_np_refresh(player)
+                self._stop_crossfade(player)
                 if player.guild:
                     await delete_queue_state(player.guild.id)
                 player.queue.clear()
@@ -947,6 +957,37 @@ class MusicCog(commands.Cog):
         except asyncio.CancelledError:
             pass
 
+    # ── Crossfade ─────────────────────────────────────────────────
+
+    def _start_crossfade(self, player: MusicPlayer):
+        self._stop_crossfade(player)
+        if player.crossfade_duration > 0:
+            player._crossfade_task = asyncio.create_task(self._crossfade_loop(player))
+
+    def _stop_crossfade(self, player: MusicPlayer):
+        if player._crossfade_task and not player._crossfade_task.done():
+            player._crossfade_task.cancel()
+            player._crossfade_task = None
+
+    async def _crossfade_loop(self, player: MusicPlayer):
+        try:
+            while True:
+                await asyncio.sleep(1)
+                if not player.current:
+                    break
+                if not player.current.length:
+                    continue
+                remaining = (player.current.length - player.position) / 1000
+                cf = player.crossfade_duration
+                if remaining <= cf and not player.paused:
+                    ratio = max(remaining / cf, 0.0)
+                    fade_vol = max(int(player._base_volume * ratio), 0)
+                    await player.set_volume(fade_vol)
+                elif player.volume != player._base_volume and not (remaining <= cf):
+                    await player.set_volume(player._base_volume)
+        except asyncio.CancelledError:
+            pass
+
     # ── Event listeners ───────────────────────────────────────────
 
     @commands.Cog.listener()
@@ -962,6 +1003,9 @@ class MusicCog(commands.Cog):
 
         if not player.text_channel:
             return
+
+        if player.crossfade_duration > 0:
+            await player.set_volume(player._base_volume)
 
         view = NowPlayingLayout(player)
         player._current_view = view
@@ -979,6 +1023,7 @@ class MusicCog(commands.Cog):
             pass
 
         self._start_np_refresh(player)
+        self._start_crossfade(player)
 
     @commands.Cog.listener()
     async def on_wavelink_track_end(self, payload: wavelink.TrackEndEventPayload):
@@ -987,6 +1032,7 @@ class MusicCog(commands.Cog):
             return
 
         self._stop_np_refresh(player)
+        self._stop_crossfade(player)
         self._skip_votes.pop(player.guild.id, None)
 
         reason = str(payload.reason)
@@ -1026,6 +1072,7 @@ class MusicCog(commands.Cog):
             return
 
         self._stop_np_refresh(player)
+        self._stop_crossfade(player)
 
         if player.text_channel:
             try:
@@ -1331,6 +1378,8 @@ class MusicCog(commands.Cog):
         if not await self._check_dj(interaction):
             return await interaction.response.send_message("You need the DJ role for this.", ephemeral=True)
         player = interaction.guild.voice_client
+        self._stop_crossfade(player)
+        self._stop_np_refresh(player)
         player.queue.clear()
         await player.stop()
         if player.now_playing_message:
@@ -1353,8 +1402,30 @@ class MusicCog(commands.Cog):
         if volume < 0 or volume > 100:
             return await interaction.response.send_message("Must be 0-100.", ephemeral=True)
         player = interaction.guild.voice_client
+        player._base_volume = volume
         await player.set_volume(volume)
         await interaction.response.send_message(f"Volume → {volume}%")
+
+    @app_commands.command(name="crossfade", description="Set crossfade duration between tracks")
+    @app_commands.describe(seconds="Crossfade duration in seconds (0 to disable, max 10)")
+    @app_commands.guild_only()
+    async def crossfade(self, interaction: discord.Interaction, seconds: int):
+        if not await self._require_player(interaction):
+            return
+        if not await self._check_dj(interaction):
+            return await interaction.response.send_message("You need the DJ role for this.", ephemeral=True)
+        if seconds < 0 or seconds > 10:
+            return await interaction.response.send_message("Must be 0-10 seconds.", ephemeral=True)
+        player = interaction.guild.voice_client
+        player.crossfade_duration = seconds
+        if seconds > 0:
+            player._base_volume = player.volume
+            self._start_crossfade(player)
+            await interaction.response.send_message(f"🔀 Crossfade → {seconds}s")
+        else:
+            self._stop_crossfade(player)
+            await player.set_volume(player._base_volume)
+            await interaction.response.send_message("🔀 Crossfade disabled")
 
     @app_commands.command(name="nowplaying", description="Show current track")
     @app_commands.guild_only()
@@ -1422,6 +1493,36 @@ class MusicCog(commands.Cog):
         track = player.queue.get_at(position - 1)
         player.queue.remove(track)
         await interaction.response.send_message(f"Removed: **[{track.title}]({track.uri})**")
+
+    @app_commands.command(name="dedup", description="Remove duplicate tracks from the queue")
+    @app_commands.guild_only()
+    async def dedup(self, interaction: discord.Interaction):
+        if not await self._require_player(interaction):
+            return
+        if not await self._check_dj(interaction):
+            return await interaction.response.send_message("You need the DJ role for this.", ephemeral=True)
+        player = interaction.guild.voice_client
+        if player.queue.is_empty:
+            return await interaction.response.send_message("Queue is empty.", ephemeral=True)
+
+        seen = set()
+        kept = []
+        removed = 0
+        for track in list(player.queue):
+            if track.uri in seen:
+                removed += 1
+                continue
+            seen.add(track.uri)
+            kept.append(track)
+
+        player.queue.clear()
+        for t in kept:
+            player.queue.put(t)
+
+        if removed:
+            await self._persist_queue(player, interaction.guild_id)
+
+        await interaction.response.send_message(f"🧹 Removed **{removed}** duplicate{'s' if removed != 1 else ''} ({len(kept)} unique tracks remaining)")
 
     @app_commands.command(name="loop", description="Toggle loop mode: off -> track -> queue")
     @app_commands.guild_only()
